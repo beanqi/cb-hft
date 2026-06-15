@@ -18,9 +18,10 @@ use crate::event::ExchangeEvent;
 use crate::fix::coinbase::auth::{CoinbaseAuth, CoinbaseCredentials};
 use crate::fix::coinbase::market_data::parse_market_data;
 use crate::fix::{FixEncoder, FixParser, MsgType};
+use crate::maker::{MakerConfig, MakerStrategy};
 use crate::market::{L1Book, L1Update, MarketEngine, MarketEvent};
 use crate::order::{OrderManager, OrderThreadAction, OrderThreadEngine, StrategyCommand};
-use crate::strategy::{NoopStrategy, Strategy};
+use crate::strategy::Strategy;
 use crate::types::{ProductSpec, SymbolId};
 
 const FIX_TIMESTAMP_FORMAT: &[FormatItem<'_>] =
@@ -34,6 +35,7 @@ pub struct RuntimeOptions {
     pub order_entry: bool,
     pub account: bool,
     pub once: bool,
+    pub dashboard: bool,
 }
 
 impl Default for RuntimeOptions {
@@ -45,6 +47,7 @@ impl Default for RuntimeOptions {
             order_entry: false,
             account: false,
             once: false,
+            dashboard: false,
         }
     }
 }
@@ -86,6 +89,7 @@ impl RuntimeOptions {
                     opts.account = true;
                 }
                 "--with-account" => opts.account = true,
+                "--dashboard" => opts.dashboard = true,
                 "--help" | "-h" => return Err(RuntimeError::Usage(usage())),
                 other => {
                     return Err(RuntimeError::Usage(format!(
@@ -393,6 +397,11 @@ pub fn run(opts: RuntimeOptions) -> Result<(), RuntimeError> {
     let config = AppConfig::from_toml_str(&config_text)?;
     print_startup_summary(&opts, &config);
 
+    if opts.dashboard {
+        crate::dashboard::serve(opts.config_path)?;
+        return Ok(());
+    }
+
     if opts.dry_run {
         println!("[runtime] dry-run ok: config parsed; no network connections opened");
         return Ok(());
@@ -418,7 +427,7 @@ pub fn run(opts: RuntimeOptions) -> Result<(), RuntimeError> {
 }
 
 fn usage() -> String {
-    "Usage: cb-hft [--config PATH] [--dry-run] [--once] [--market-data-only|--order-only|--account-only|--with-order-entry|--with-account] [--no-market-data] [--no-order-entry] [--no-account]".to_string()
+    "Usage: cb-hft [--config PATH] [--dashboard] [--dry-run] [--once] [--market-data-only|--order-only|--account-only|--with-order-entry|--with-account] [--no-market-data] [--no-order-entry] [--no-account]".to_string()
 }
 
 fn print_startup_summary(opts: &RuntimeOptions, config: &AppConfig) {
@@ -441,16 +450,25 @@ fn product_ids(config: &AppConfig) -> Vec<String> {
 
 fn credentials_from_env(config: &AppConfig) -> Result<CoinbaseCredentials, RuntimeError> {
     let mut missing = Vec::new();
-    let api_key = env::var(&config.coinbase.api_key_env).map_err(|_| {
-        missing.push(config.coinbase.api_key_env.clone());
-    });
-    let secret = env::var(&config.coinbase.api_secret_env).map_err(|_| {
-        missing.push(config.coinbase.api_secret_env.clone());
-    });
-    let passphrase = env::var(&config.coinbase.passphrase_env).map_err(|_| {
-        missing.push(config.coinbase.passphrase_env.clone());
-    });
+    let api_key = env::var(&config.coinbase.api_key_env)
+        .ok()
+        .or_else(|| config.coinbase.api_key.clone());
+    let secret = env::var(&config.coinbase.api_secret_env)
+        .ok()
+        .or_else(|| config.coinbase.api_secret.clone());
+    let passphrase = env::var(&config.coinbase.passphrase_env)
+        .ok()
+        .or_else(|| config.coinbase.passphrase.clone());
 
+    if api_key.is_none() {
+        missing.push(config.coinbase.api_key_env.clone());
+    }
+    if secret.is_none() {
+        missing.push(config.coinbase.api_secret_env.clone());
+    }
+    if passphrase.is_none() {
+        missing.push(config.coinbase.passphrase_env.clone());
+    }
     if !missing.is_empty() {
         return Err(RuntimeError::MissingCredentials(missing));
     }
@@ -515,11 +533,13 @@ fn run_live_pipeline(
     let (command_tx, command_rx) = mpsc::channel::<StrategyCommand>();
     let (exchange_event_tx, exchange_event_rx) = mpsc::channel::<ExchangeEvent>();
 
-    let strategy_products: Vec<_> = config.products.iter().map(|product| product.spec).collect();
+    let strategy_products = config.products.clone();
+    let strategy_config = config.strategy;
     let strategy_shutdown = Arc::clone(&shutdown);
     let strategy_handle = thread::spawn(move || {
         run_strategy_threads(
             strategy_products,
+            strategy_config,
             market_rx,
             command_tx,
             exchange_event_rx,
@@ -563,15 +583,31 @@ fn run_live_pipeline(
 }
 
 fn run_strategy_threads(
-    products: Vec<ProductSpec>,
+    products: Vec<ProductConfig>,
+    strategy_config: crate::config::StrategyConfig,
     market_rx: Receiver<MarketEvent>,
     command_tx: Sender<StrategyCommand>,
     exchange_event_rx: Receiver<ExchangeEvent>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut engines: Vec<MarketEngine<NoopStrategy>> = products
+    let mut engines: Vec<MarketEngine<MakerStrategy>> = products
         .iter()
-        .map(|spec| MarketEngine::new(spec.symbol_id, NoopStrategy))
+        .map(|product| {
+            let spec = product.spec;
+            MarketEngine::new(
+                spec.symbol_id,
+                MakerStrategy::new(
+                    MakerConfig {
+                        symbol_id: spec.symbol_id,
+                        quote_qty: product.maker_quote_qty,
+                        quote_tick_offset: spec.price_tick.0
+                            * strategy_config.quote_tick_offset_ticks,
+                        requote_ticks: spec.price_tick.0 * strategy_config.requote_ticks,
+                    },
+                    strategy_config.trend,
+                ),
+            )
+        })
         .collect();
 
     while !shutdown.load(Ordering::SeqCst) {
@@ -592,7 +628,7 @@ fn run_strategy_threads(
 }
 
 fn route_market_to_strategy(
-    engines: &mut [MarketEngine<NoopStrategy>],
+    engines: &mut [MarketEngine<MakerStrategy>],
     event: MarketEvent,
     command_tx: &Sender<StrategyCommand>,
 ) {
@@ -607,7 +643,7 @@ fn route_market_to_strategy(
 }
 
 fn route_exchange_to_strategy(
-    engines: &mut [MarketEngine<NoopStrategy>],
+    engines: &mut [MarketEngine<MakerStrategy>],
     event: ExchangeEvent,
     command_tx: &Sender<StrategyCommand>,
 ) {
@@ -938,6 +974,7 @@ fn product_by_symbol<'a>(config: &'a AppConfig, symbol: &str) -> Option<(usize, 
 }
 
 fn print_market_event(event: MarketEvent, book: &mut L1Book) {
+    append_feed_line("market", &event);
     match event {
         MarketEvent::L1 {
             symbol_id,
@@ -977,6 +1014,7 @@ fn print_market_event(event: MarketEvent, book: &mut L1Book) {
 }
 
 fn print_order_exchange_event(event: ExchangeEvent) {
+    append_feed_line("exchange", &event);
     match event {
         ExchangeEvent::Order(order) => println!(
             "[order.fix.event] symbol_id={} client_order_id={} exchange_order_id={} exec_id={} status={:?} filled_qty={} remaining_qty={} avg_px={} last_px={} last_qty={} seq={} recv_ts_ns={}",
@@ -1005,6 +1043,29 @@ fn print_order_exchange_event(event: ExchangeEvent) {
             fill.recv_ts_ns
         ),
         other => println!("[order.fix.event] {other:?}"),
+    }
+}
+
+fn append_feed_line<T: std::fmt::Debug>(kind: &str, value: &T) {
+    let Ok(path) = env::var("CB_HFT_FEED_FILE") else {
+        return;
+    };
+    let line = format!(
+        "{{\"kind\":\"{}\",\"ts_ns\":{},\"debug\":{}}}\n",
+        kind,
+        recv_ts_ns(),
+        serde_json::to_string(&format!("{value:?}"))
+            .unwrap_or_else(|_| "\"<encode-error>\"".to_string())
+    );
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
