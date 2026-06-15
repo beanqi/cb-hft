@@ -360,16 +360,19 @@ impl OrderThreadEngine {
         let seq = self.take_seq_num();
         let price = format_scaled(accepted.command.price.0, spec.price_scale);
         let qty = format_scaled(accepted.command.qty.0, spec.qty_scale);
-        let fix = self.encoder.encode_limit_new_order_single(
-            seq,
-            sending_time,
-            &accepted.client_order_id,
-            spec.coinbase_product,
-            accepted.command.side,
-            &price,
-            &qty,
-            accepted.command.post_only,
-        );
+        let fix = self
+            .encoder
+            .encode_limit_new_order_single_with_time_in_force(
+                seq,
+                sending_time,
+                &accepted.client_order_id,
+                spec.coinbase_product,
+                accepted.command.side,
+                &price,
+                &qty,
+                accepted.command.post_only,
+                accepted.command.time_in_force,
+            );
         vec![OrderThreadAction::SendFix(fix)]
     }
 

@@ -1,4 +1,5 @@
 use crate::fix::coinbase::auth::{CoinbaseAuth, CoinbaseAuthError, CoinbaseCredentials};
+use crate::order::TimeInForce;
 use crate::types::Side;
 
 use super::{SOH, checksum};
@@ -118,6 +119,32 @@ impl FixEncoder {
         order_qty: &str,
         post_only: bool,
     ) -> Vec<u8> {
+        self.encode_limit_new_order_single_with_time_in_force(
+            msg_seq_num,
+            sending_time,
+            cl_ord_id,
+            symbol,
+            side,
+            price,
+            order_qty,
+            post_only,
+            TimeInForce::GoodTillCancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_limit_new_order_single_with_time_in_force(
+        &self,
+        msg_seq_num: u64,
+        sending_time: &str,
+        cl_ord_id: &str,
+        symbol: &str,
+        side: Side,
+        price: &str,
+        order_qty: &str,
+        post_only: bool,
+        time_in_force: TimeInForce,
+    ) -> Vec<u8> {
         let mut body = self.standard_body("D", msg_seq_num, sending_time);
         push_field(&mut body, 11, cl_ord_id);
         push_field(&mut body, 55, symbol);
@@ -127,6 +154,9 @@ impl FixEncoder {
         push_field(&mut body, 44, price);
         if post_only {
             push_field(&mut body, 18, "6");
+        }
+        if let Some(value) = time_in_force_to_fix(time_in_force) {
+            push_field(&mut body, 59, value);
         }
         self.wrap(body)
     }
@@ -181,5 +211,13 @@ fn side_to_fix(side: Side) -> &'static str {
     match side {
         Side::Buy => "1",
         Side::Sell => "2",
+    }
+}
+
+fn time_in_force_to_fix(time_in_force: TimeInForce) -> Option<&'static str> {
+    match time_in_force {
+        TimeInForce::GoodTillCancel => None,
+        TimeInForce::ImmediateOrCancel => Some("3"),
+        TimeInForce::FillOrKill => Some("4"),
     }
 }

@@ -964,9 +964,10 @@ fn print_market_event(event: MarketEvent, book: &mut L1Book) {
             );
         }
         MarketEvent::Trade(trade) => println!(
-            "[market.fix.trade] symbol_id={} trade_id={} price={} qty={} seq={} recv_ts_ns={}",
+            "[market.fix.trade] symbol_id={} trade_id={} side={:?} price={} qty={} seq={} recv_ts_ns={}",
             trade.symbol_id.0,
             trade.trade_id,
+            trade.side,
             trade.price.0,
             trade.qty.0,
             trade.sequence,

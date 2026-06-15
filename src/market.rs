@@ -1,7 +1,7 @@
 use crate::event::ExchangeEvent;
 use crate::order::StrategyCommand;
 use crate::strategy::{Strategy, StrategyContext};
-use crate::types::{Price, Qty, SymbolId};
+use crate::types::{Price, Qty, Side, SymbolId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarketEvent {
@@ -22,6 +22,7 @@ pub struct Trade {
     pub symbol_id: SymbolId,
     pub recv_ts_ns: u64,
     pub trade_id: u64,
+    pub side: Option<Side>,
     pub price: Price,
     pub qty: Qty,
     pub sequence: u64,

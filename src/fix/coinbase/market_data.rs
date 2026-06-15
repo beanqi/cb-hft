@@ -1,6 +1,6 @@
 use crate::fix::{FixFrame, FixParser};
 use crate::market::{MarketEvent, Trade};
-use crate::types::{DecimalParseError, Price, ProductSpec, Qty};
+use crate::types::{DecimalParseError, Price, ProductSpec, Qty, Side};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MarketDataError {
@@ -28,6 +28,7 @@ struct PendingEntry {
     price: Option<Price>,
     qty: Option<Qty>,
     trade_id: Option<u64>,
+    side: Option<Side>,
 }
 
 pub fn parse_market_data(
@@ -65,6 +66,9 @@ pub fn parse_market_data(
             270 => pending.price = Some(Price::parse_scaled(field.value, spec.price_scale)?),
             271 => pending.qty = Some(Qty::parse_scaled(field.value, spec.qty_scale)?),
             278 => pending.trade_id = Some(parse_u64(field.value)?),
+            // Coinbase FIX trade entries may include Side(54). When present, treat it as
+            // aggressor side for short-horizon trade imbalance.
+            54 => pending.side = parse_side(field.value),
             _ => {}
         }
     }
@@ -114,6 +118,7 @@ fn flush_entry(
                 symbol_id: spec.symbol_id,
                 recv_ts_ns,
                 trade_id: pending.trade_id.unwrap_or(0),
+                side: pending.side,
                 price,
                 qty,
                 sequence,
@@ -122,6 +127,14 @@ fn flush_entry(
         _ => {}
     }
     *pending = PendingEntry::default();
+}
+
+fn parse_side(input: &[u8]) -> Option<Side> {
+    match input {
+        b"1" => Some(Side::Buy),
+        b"2" => Some(Side::Sell),
+        _ => None,
+    }
 }
 
 fn parse_u64(input: &[u8]) -> Result<u64, MarketDataError> {

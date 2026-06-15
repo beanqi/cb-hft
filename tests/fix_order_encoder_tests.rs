@@ -1,4 +1,5 @@
 use cb_hft::fix::{FixEncoder, FixParser, MsgType};
+use cb_hft::order::TimeInForce;
 use cb_hft::types::Side;
 
 fn field(message: &[u8], tag: u32) -> Option<&[u8]> {
@@ -35,6 +36,37 @@ fn encoder_builds_limit_new_order_single_with_post_only_exec_inst() {
     assert_eq!(field(&message, 40), Some(&b"2"[..]));
     assert_eq!(field(&message, 44), Some(&b"65000.12"[..]));
     assert_eq!(field(&message, 18), Some(&b"6"[..]));
+}
+
+#[test]
+fn encoder_builds_limit_ioc_new_order_single_with_time_in_force() {
+    let encoder = FixEncoder::new("FIX.4.2", "SENDER", "TARGET");
+
+    let message = encoder.encode_limit_new_order_single_with_time_in_force(
+        9,
+        "20260613-12:00:02.000",
+        "cbhft-ioc-1",
+        "BTC-USD",
+        Side::Buy,
+        "5000.00",
+        "0.00200000",
+        false,
+        TimeInForce::ImmediateOrCancel,
+    );
+
+    let parser = FixParser::default();
+    let (frame, consumed) = parser.next_frame(&message).unwrap().unwrap();
+
+    assert_eq!(consumed, message.len());
+    assert_eq!(frame.msg_type, MsgType::NewOrderSingle);
+    assert_eq!(field(&message, 11), Some(&b"cbhft-ioc-1"[..]));
+    assert_eq!(field(&message, 55), Some(&b"BTC-USD"[..]));
+    assert_eq!(field(&message, 54), Some(&b"1"[..]));
+    assert_eq!(field(&message, 38), Some(&b"0.00200000"[..]));
+    assert_eq!(field(&message, 40), Some(&b"2"[..]));
+    assert_eq!(field(&message, 44), Some(&b"5000.00"[..]));
+    assert_eq!(field(&message, 59), Some(&b"3"[..]));
+    assert_eq!(field(&message, 18), None);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use cb_hft::fix::FixParser;
 use cb_hft::fix::coinbase::market_data::parse_market_data;
 use cb_hft::market::{MarketEvent, Trade};
-use cb_hft::types::{Price, ProductSpec, Qty, SymbolId};
+use cb_hft::types::{Price, ProductSpec, Qty, Side, SymbolId};
 
 fn fix_message(body: &[u8]) -> Vec<u8> {
     let mut msg = Vec::new();
@@ -55,7 +55,7 @@ fn parses_l1_bid_ask_snapshot_into_single_market_event() {
 fn parses_trade_entry_into_trade_event() {
     let parser = FixParser::default();
     let msg = fix_message(
-        b"35=X\x0134=43\x0155=BTC-USD\x01268=1\x01269=2\x01270=65010.25\x01271=0.01\x01278=987654\x01",
+        b"35=X\x0134=43\x0155=BTC-USD\x01268=1\x01269=2\x0154=1\x01270=65010.25\x01271=0.01\x01278=987654\x01",
     );
     let (frame, _) = parser.next_frame(&msg).unwrap().unwrap();
 
@@ -68,6 +68,7 @@ fn parses_trade_entry_into_trade_event() {
             symbol_id: SymbolId(0),
             recv_ts_ns: 2_000,
             trade_id: 987654,
+            side: Some(Side::Buy),
             price: Price(6_501_025),
             qty: Qty(1_000_000),
             sequence: 43,
