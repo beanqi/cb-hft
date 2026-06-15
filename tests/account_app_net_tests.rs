@@ -1,7 +1,7 @@
-use cb_hft::account::{AccountSnapshot, BalanceBook, UserFeedEvent};
+use cb_hft::account::{AccountSnapshot, BalanceBook};
 use cb_hft::app::AppTopology;
 use cb_hft::config::AppConfig;
-use cb_hft::event::{BalanceEvent, ExchangeEvent};
+use cb_hft::event::BalanceEvent;
 use cb_hft::net::{SocketTuning, TcpNoDelay};
 use cb_hft::supervisor::{ShutdownReason, ShutdownSignal};
 use cb_hft::telemetry::LatencySample;
@@ -51,7 +51,7 @@ min_notional = 100
 }
 
 #[test]
-fn balance_book_applies_snapshot_and_user_feed_updates() {
+fn balance_book_applies_snapshot_and_balance_updates() {
     let mut book = BalanceBook::default();
     let usd = AssetId::from_static("USD");
     let btc = AssetId::from_static("BTC");
@@ -75,34 +75,17 @@ fn balance_book_applies_snapshot_and_user_feed_updates() {
         },
     ]));
 
-    book.apply_user_feed_event(UserFeedEvent::Balance(BalanceEvent {
+    book.apply_balance_update(BalanceEvent {
         asset_id: usd.clone(),
         total: Qty(1_100),
         available: Qty(1_000),
         hold: Qty(100),
         update_ts_ns: 20,
         recv_ts_ns: 21,
-    }));
+    });
 
     assert_eq!(book.balance(&usd).unwrap().total, Qty(1_100));
     assert_eq!(book.balance(&btc).unwrap().total, Qty(2));
-}
-
-#[test]
-fn user_feed_balance_event_converts_to_exchange_event() {
-    let event = UserFeedEvent::Balance(BalanceEvent {
-        asset_id: AssetId::from_static("USD"),
-        total: Qty(10),
-        available: Qty(9),
-        hold: Qty(1),
-        update_ts_ns: 1,
-        recv_ts_ns: 2,
-    });
-
-    assert!(matches!(
-        event.into_exchange_event(),
-        ExchangeEvent::Balance(_)
-    ));
 }
 
 #[test]

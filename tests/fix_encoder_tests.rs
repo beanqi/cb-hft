@@ -106,9 +106,8 @@ fn encoder_builds_market_data_request_basics() {
     assert!(message.windows(16).any(|w| w == b"262=book-BTC-USD"));
     assert!(message.windows(5).any(|w| w == b"263=1"));
     assert!(message.windows(5).any(|w| w == b"264=1"));
-    assert!(message.windows(5).any(|w| w == b"267=2"));
-    assert!(message.windows(5).any(|w| w == b"269=0"));
-    assert!(message.windows(5).any(|w| w == b"269=1"));
+    assert!(!message.windows(5).any(|w| w == b"267="));
+    assert!(!message.windows(5).any(|w| w == b"269="));
     assert!(message.windows(5).any(|w| w == b"146=2"));
     assert!(message.windows(10).any(|w| w == b"55=BTC-USD"));
     assert!(message.windows(10).any(|w| w == b"55=ETH-USD"));

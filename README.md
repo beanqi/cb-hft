@@ -1,27 +1,30 @@
 # cb-hft
 
-`cb-hft` 是一个面向 Coinbase Exchange 的 Rust 交易所接入项目。当前仓库重点是把行情、订单/成交用户推送、资产快照等交易所交互层先跑通；策略部分暂时留空，目前运行时只打印接收到的数据，不会自动发单。
+`cb-hft` 是面向 Coinbase Exchange 的 Rust FIX 接入项目。当前运行路径按官方 Coinbase Exchange **FIX Market Data 5.0** 文档接入行情：通过 TLS 连接 `fix-md` 网关，Logon 后发送 `MarketDataRequest(35=V)` 订阅 L1 一档深度和逐笔成交，并把 `35=W` / `35=X` 解析为内部 `MarketEvent`。
 
 ## 当前能力
 
 已实现：
 
-- Coinbase WebSocket 公共行情接入：
-  - `ticker`：打印 L1 bid/ask、最新成交价、时间和 sequence。
-  - `matches`：打印逐笔成交。
-- Coinbase WebSocket 认证行情/用户推送接入：
-  - 配置 API 凭据后，行情订阅会尝试启用 `level2` 深度。
-  - 配置 API 凭据后，会订阅 `user` / `full` 用户通道，打印订单和成交事件。
-- Coinbase REST 资产快照：
-  - 配置 API 凭据后，启动时请求 `GET /accounts` 并打印资产余额、可用余额、冻结余额。
-- 本地协议/领域模型：
-  - FIX parser / encoder。
-  - Coinbase FIX logon 签名。
-  - Coinbase Market Data fixture 解析。
-  - ExecutionReport fixture 解析。
-  - OrderManager 基础订单生命周期和风控检查。
-  - SPSC ring topology 骨架。
-  - Noop strategy / strategy trait 骨架。
+- Coinbase FIX Market Data 行情接入：
+  - 生产：`tcp+ssl://fix-md.exchange.coinbase.com:6121`（Snapshot Enabled Gateway）
+  - 沙盒：`tcp+ssl://fix-md.sandbox.exchange.coinbase.com:6121`（Snapshot Enabled Gateway）
+  - Logon：`FIXT.1.1`、`TargetCompID=Coinbase`、`DefaultApplVerID(1137)=9`
+  - 订阅：`35=V`、`263=1`、`264=1`，即 L1 top-of-book
+  - 解析：`35=W` snapshot 和 `35=X` incremental refresh 中的 Bid/Offer/Trade
+- FIX 基础协议：
+  - frame parser、BodyLength、Checksum 校验
+  - heartbeat / test request response
+  - Coinbase FIX Logon HMAC-SHA256 base64 签名
+  - MarketDataRequest 编码
+  - ExecutionReport fixture 解析
+- Coinbase REST 资产快照（可选）：
+  - 启动参数加 `--with-account` 或 `--account-only` 时请求 `GET /accounts`
+- 本地交易系统骨架：
+  - `MarketEvent`、`L1Book`、`MarketEngine`
+  - OrderManager 基础订单生命周期和风控检查
+  - SPSC ring topology 骨架
+  - Noop strategy / strategy trait 骨架
 
 当前不会自动下单。`order` / `fix` 模块里已有 FIX NewOrderSingle、CancelRequest 编码和 ExecutionReport 解析基础，但真实 Order Entry FIX 网络 session 尚未作为默认运行路径接入。
 
@@ -33,20 +36,20 @@ cb-hft/
 ├── Cargo.lock
 ├── README.md
 ├── config/
-│   ├── prod.toml.example       # 生产环境示例配置
-│   └── sandbox.toml.example    # 沙盒环境示例配置
+│   ├── prod.toml.example
+│   └── sandbox.toml.example
 ├── docs/
 │   └── coinbase-hft-architecture.md
 ├── src/
 │   ├── main.rs                 # 二进制入口，调用 runtime
 │   ├── lib.rs                  # library module exports
-│   ├── runtime.rs              # 当前可运行系统：WS/REST 接入和打印
+│   ├── runtime.rs              # FIX Market Data 运行时 + 可选 REST accounts
 │   ├── config.rs               # TOML 配置解析、产品配置解析
 │   ├── types.rs                # Price/Qty/Symbol/Product 等基础类型
 │   ├── event.rs                # ExchangeEvent/BalanceEvent/FillEvent 等事件类型
 │   ├── market.rs               # MarketEvent、L1Book、MarketEngine
 │   ├── order.rs                # StrategyCommand、OrderManager、OrderThreadEngine
-│   ├── account.rs              # REST account snapshot / WS user feed JSON 解码
+│   ├── account.rs              # REST account snapshot 解码
 │   ├── strategy.rs             # Strategy trait、NoopStrategy、测试策略
 │   ├── ring.rs                 # rtrb SPSC command/event ring 封装
 │   ├── app.rs                  # AppTopology：按 symbol 创建 ring 拓扑
@@ -60,8 +63,8 @@ cb-hft/
 │       ├── encoder.rs          # FIX heartbeat/logon/MD/new/cancel 编码
 │       ├── session.rs          # FIX session heartbeat/test request/sequence 基础逻辑
 │       └── coinbase/
-│           ├── auth.rs         # Coinbase REST/WS/FIX 签名
-│           ├── market_data.rs  # FIX Market Data fixture -> MarketEvent
+│           ├── auth.rs         # Coinbase REST/FIX 签名
+│           ├── market_data.rs  # FIX Market Data -> MarketEvent
 │           └── order_entry.rs  # FIX ExecutionReport -> OrderEvent
 └── tests/
     ├── *_tests.rs              # parser、encoder、market、order、account、ring 等测试
@@ -117,16 +120,14 @@ min_notional = 100
 说明：
 
 - `environment` 决定 Coinbase endpoint：
-  - `prod` / `production` -> `wss://ws-feed.exchange.coinbase.com` 和 `https://api.exchange.coinbase.com`
-  - 其他值默认按 sandbox 处理 -> `wss://ws-feed-public.sandbox.exchange.coinbase.com` 和 `https://api-public.sandbox.exchange.coinbase.com`
+  - `prod` / `production` -> `fix-md.exchange.coinbase.com:6121` 和 `https://api.exchange.coinbase.com`
+  - 其他值默认按 sandbox 处理 -> `fix-md.sandbox.exchange.coinbase.com:6121` 和 `https://api-public.sandbox.exchange.coinbase.com`
 - `api_key_env` / `api_secret_env` / `passphrase_env` 是环境变量名称，不要把真实密钥写入配置文件。
 - `products` 控制订阅的 Coinbase 产品列表。
 
 ## API 凭据
 
-如果只看公共行情，不需要 API 凭据。
-
-如果要启用资产快照、用户订单/成交推送、认证 `level2` 深度，请设置：
+Coinbase FIX Market Data 文档要求使用与 FIX Order Entry 相同的认证，因此运行真实 FIX 行情需要设置：
 
 ```bash
 export COINBASE_API_KEY='your-api-key'
@@ -150,66 +151,46 @@ cd /Users/ml015/code/rust/cb-hft
 /Users/ml015/.cargo/bin/cargo run -- --dry-run --config config/sandbox.toml.example
 ```
 
-预期会打印配置、环境、产品列表，并提示 dry-run 成功。
-
-### 2. 只运行公共行情
-
-```bash
-/Users/ml015/.cargo/bin/cargo run -- --market-data-only --config config/prod.toml.example
-```
-
-会打印类似：
-
-```text
-[market.l1] product=BTC-USD bid=... bid_size=... ask=... ask_size=... price=... time=... seq=...
-[market.trade] product=BTC-USD side=... price=... size=... trade_id=... time=... seq=...
-```
-
-### 3. 公共行情 smoke test，只接收少量消息后退出
-
-```bash
-/Users/ml015/.cargo/bin/cargo run -- --market-data-only --once --config config/prod.toml.example
-```
-
-`--once` 当前会在对应线程收到少量消息后退出，适合做启动和网络连通性验证。
-
-### 4. 启用资产和用户订单/成交 feed
-
-先设置 API 凭据，然后运行：
+### 2. 运行 FIX 行情
 
 ```bash
 export COINBASE_API_KEY='your-api-key'
 export COINBASE_API_SECRET='your-base64-secret'
 export COINBASE_PASSPHRASE='your-passphrase'
 
-/Users/ml015/.cargo/bin/cargo run -- --config config/prod.toml.example
+/Users/ml015/.cargo/bin/cargo run -- --market-data-only --config config/prod.toml.example
 ```
 
-启动后会：
+会连接 FIX Market Data Snapshot Enabled Gateway，发送 Logon 和 L1 MarketDataRequest，然后打印类似：
 
-1. 打印配置摘要。
-2. 请求 REST `/accounts` 并打印资产。
-3. 启动 market WebSocket 打印行情。
-4. 启动 authenticated user WebSocket 打印用户订单/成交事件。
+```text
+[market.fix.l1] symbol_id=0 bid_px=... bid_qty=... ask_px=... ask_qty=... seq=... recv_ts_ns=...
+[market.fix.trade] symbol_id=0 trade_id=... price=... qty=... seq=... recv_ts_ns=...
+```
 
-### 5. 只运行账户/用户 feed
+### 3. FIX 行情 smoke test，收到少量事件后退出
 
 ```bash
-/Users/ml015/.cargo/bin/cargo run -- --account-only --config config/prod.toml.example
+/Users/ml015/.cargo/bin/cargo run -- --market-data-only --once --config config/prod.toml.example
 ```
 
-该模式需要 API 凭据。缺少凭据时会直接报错退出。
+### 4. 启用 REST 资产快照
+
+```bash
+/Users/ml015/.cargo/bin/cargo run -- --with-account --config config/prod.toml.example
+```
 
 ## 命令行参数
 
 ```text
 --config PATH          指定 TOML 配置文件，默认 config/sandbox.toml.example
 --dry-run              只解析配置并打印摘要，不打开网络连接
---once                 收到少量消息后退出，用于 smoke test
---market-data-only     只启动行情接入，不启动 REST 资产和 user feed
---account-only         只启动 REST 资产和 user feed，不启动公共行情
+--once                 收到少量行情事件后退出，用于 smoke test
+--market-data-only     只启动 FIX 行情接入，不请求 REST assets
+--account-only         只请求 REST assets，不启动 FIX 行情
+--with-account         启动 FIX 行情前先请求 REST assets
 --no-market-data       禁用行情接入
---no-account           禁用账户/用户 feed
+--no-account           禁用 REST assets
 -h, --help             打印用法
 ```
 
@@ -233,28 +214,9 @@ export COINBASE_PASSPHRASE='your-passphrase'
 /Users/ml015/.cargo/bin/cargo build
 ```
 
-生产公共行情 smoke test：
-
-```bash
-/Users/ml015/.cargo/bin/cargo run -- --market-data-only --once --config config/prod.toml.example
-```
-
 ## 当前限制和后续 TODO
 
-当前运行时目标是“能跑起来接数据并打印”，不是完整实盘交易系统。已知限制：
-
 - 策略层目前留空，不会自动发单。
-- WebSocket 收到的数据当前主要在 `runtime.rs` 中打印，尚未全部接入原设计里的 ring + `MarketEngine` 热路径。
-- FIX Order Entry 真实 TCP/TLS session 尚未作为默认运行路径接入。
+- Order Entry FIX 真实 TCP/TLS session 尚未作为默认运行路径接入。
 - 自动重连、sequence gap 恢复、fail-safe、断线后撤单/暂停交易等生产级逻辑仍待完善。
-- `level2` 深度在 Coinbase 当前规则下需要认证；无 API 凭据时只订阅公开 `ticker` 和 `matches`。
 - 延迟 benchmark 尚未补齐，当前没有验收 `parse + L1 apply p99 < 2µs`。
-
-建议下一步：
-
-1. 把 WebSocket/FIX 数据统一转成内部 `MarketEvent` / `ExchangeEvent`。
-2. 接入 ring topology 和 `MarketEngine<NoopStrategy>`。
-3. 完成 authenticated `level2` depth 的本地 book 维护。
-4. 实现 Order Entry FIX 网络 session，但默认仍保持 dry-run / no-trade 安全模式。
-5. 增加 reconnect/fail-safe/metrics。
-6. 增加 benchmark。 

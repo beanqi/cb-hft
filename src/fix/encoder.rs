@@ -84,13 +84,21 @@ impl FixEncoder {
         md_req_id: &str,
         symbols: &[&str],
     ) -> Vec<u8> {
+        self.encode_market_data_request_with_depth(msg_seq_num, sending_time, md_req_id, 1, symbols)
+    }
+
+    pub fn encode_market_data_request_with_depth(
+        &self,
+        msg_seq_num: u64,
+        sending_time: &str,
+        md_req_id: &str,
+        market_depth: u32,
+        symbols: &[&str],
+    ) -> Vec<u8> {
         let mut body = self.standard_body("V", msg_seq_num, sending_time);
         push_field(&mut body, 262, md_req_id);
         push_field(&mut body, 263, "1");
-        push_field(&mut body, 264, "1");
-        push_field(&mut body, 267, "2");
-        push_field(&mut body, 269, "0");
-        push_field(&mut body, 269, "1");
+        push_field(&mut body, 264, &market_depth.to_string());
         push_field(&mut body, 146, &symbols.len().to_string());
         for symbol in symbols {
             push_field(&mut body, 55, symbol);

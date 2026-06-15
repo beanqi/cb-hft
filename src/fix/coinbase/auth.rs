@@ -1,6 +1,5 @@
 use base64::{Engine as _, engine::general_purpose};
 use hmac::{Hmac, KeyInit, Mac};
-use serde::Serialize;
 use sha2::Sha256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,7 +27,6 @@ impl CoinbaseCredentials {
 pub enum CoinbaseAuthError {
     InvalidBase64Secret,
     InvalidHmacKey,
-    SerializeSubscribe,
 }
 
 impl core::fmt::Display for CoinbaseAuthError {
@@ -59,7 +57,9 @@ impl CoinbaseAuth {
 
     /// Coinbase Exchange FIX Logon prehash shape documented for authenticated Logon.
     ///
-    /// The prehash is: SendingTime + MsgType + MsgSeqNum + SenderCompID + TargetCompID + Password.
+    /// Official FIX connectivity sample signs the SOH-delimited string:
+    /// SendingTime<SOH>MsgType<SOH>MsgSeqNum<SOH>APIKey<SOH>TargetCompID<SOH>Passphrase.
+    /// The signature message has no trailing separator.
     pub fn sign_fix_logon(
         credentials: &CoinbaseCredentials,
         sending_time: &str,
@@ -68,41 +68,11 @@ impl CoinbaseAuth {
         target_comp_id: &str,
     ) -> Result<String, CoinbaseAuthError> {
         let prehash = format!(
-            "{sending_time}{msg_type}{msg_seq_num}{}{target_comp_id}{}",
+            "{sending_time}{msg_type}{msg_seq_num}{}{target_comp_id}{}",
             credentials.api_key, credentials.passphrase
         );
         sign_base64_secret(&credentials.secret_b64, prehash.as_bytes())
     }
-
-    pub fn websocket_subscribe_json(
-        credentials: &CoinbaseCredentials,
-        timestamp: &str,
-        channels: &[&str],
-        product_ids: &[&str],
-    ) -> Result<String, CoinbaseAuthError> {
-        let signature = Self::sign_rest(credentials, timestamp, "GET", "/users/self/verify", "")?;
-        let msg = WsSubscribe {
-            r#type: "subscribe",
-            channels,
-            product_ids,
-            signature: &signature,
-            key: &credentials.api_key,
-            passphrase: &credentials.passphrase,
-            timestamp,
-        };
-        serde_json::to_string(&msg).map_err(|_| CoinbaseAuthError::SerializeSubscribe)
-    }
-}
-
-#[derive(Serialize)]
-struct WsSubscribe<'a> {
-    r#type: &'static str,
-    channels: &'a [&'a str],
-    product_ids: &'a [&'a str],
-    signature: &'a str,
-    key: &'a str,
-    passphrase: &'a str,
-    timestamp: &'a str,
 }
 
 fn sign_base64_secret(secret_b64: &str, prehash: &[u8]) -> Result<String, CoinbaseAuthError> {

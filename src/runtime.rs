@@ -1,16 +1,25 @@
 use std::env;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
-use tungstenite::{Message, connect};
+use native_tls::TlsConnector;
+use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 
-use crate::config::AppConfig;
+use crate::account::parse_rest_accounts_snapshot;
+use crate::config::{AppConfig, ProductConfig};
 use crate::fix::coinbase::auth::{CoinbaseAuth, CoinbaseCredentials};
+use crate::fix::coinbase::market_data::parse_market_data;
+use crate::fix::{FixEncoder, FixParser, MsgType};
+use crate::market::{L1Book, L1Update, MarketEvent};
+use crate::types::ProductSpec;
+
+const FIX_TIMESTAMP_FORMAT: &[FormatItem<'_>] =
+    format_description!("[year][month][day]-[hour]:[minute]:[second].[subsecond digits:3]");
 
 #[derive(Clone, Debug)]
 pub struct RuntimeOptions {
@@ -27,7 +36,7 @@ impl Default for RuntimeOptions {
             config_path: "config/sandbox.toml.example".to_string(),
             dry_run: false,
             market_data: true,
-            account: true,
+            account: false,
             once: false,
         }
     }
@@ -60,6 +69,7 @@ impl RuntimeOptions {
                     opts.market_data = false;
                     opts.account = true;
                 }
+                "--with-account" => opts.account = true,
                 "--help" | "-h" => return Err(RuntimeError::Usage(usage())),
                 other => {
                     return Err(RuntimeError::Usage(format!(
@@ -77,13 +87,16 @@ impl RuntimeOptions {
 pub enum RuntimeError {
     Usage(String),
     Io(std::io::Error),
+    Tls(native_tls::Error),
     Config(crate::config::ConfigError),
     MissingCredentials(Vec<String>),
-    WebSocket(tungstenite::Error),
     Http(String),
-    Json(serde_json::Error),
     Auth(crate::fix::coinbase::auth::CoinbaseAuthError),
-    ThreadPanic(&'static str),
+    Fix(crate::fix::FixError),
+    MarketData(crate::fix::coinbase::market_data::MarketDataError),
+    Account(crate::account::AccountParseError),
+    Time(time::error::Format),
+    Protocol(String),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -91,19 +104,20 @@ impl std::fmt::Display for RuntimeError {
         match self {
             Self::Usage(msg) => write!(f, "{msg}"),
             Self::Io(err) => write!(f, "io error: {err}"),
+            Self::Tls(err) => write!(f, "tls error: {err}"),
             Self::Config(err) => write!(f, "config error: {err:?}"),
-            Self::MissingCredentials(names) => {
-                write!(
-                    f,
-                    "missing credential environment variables: {}",
-                    names.join(", ")
-                )
-            }
-            Self::WebSocket(err) => write!(f, "websocket error: {err}"),
+            Self::MissingCredentials(names) => write!(
+                f,
+                "missing credential environment variables: {}",
+                names.join(", ")
+            ),
             Self::Http(err) => write!(f, "http error: {err}"),
-            Self::Json(err) => write!(f, "json error: {err}"),
             Self::Auth(err) => write!(f, "auth error: {err}"),
-            Self::ThreadPanic(name) => write!(f, "{name} thread panicked"),
+            Self::Fix(err) => write!(f, "fix error: {err}"),
+            Self::MarketData(err) => write!(f, "market data parse error: {err:?}"),
+            Self::Account(err) => write!(f, "account parse error: {err}"),
+            Self::Time(err) => write!(f, "time format error: {err}"),
+            Self::Protocol(err) => write!(f, "protocol error: {err}"),
         }
     }
 }
@@ -116,27 +130,45 @@ impl From<std::io::Error> for RuntimeError {
     }
 }
 
+impl From<native_tls::Error> for RuntimeError {
+    fn from(value: native_tls::Error) -> Self {
+        Self::Tls(value)
+    }
+}
+
 impl From<crate::config::ConfigError> for RuntimeError {
     fn from(value: crate::config::ConfigError) -> Self {
         Self::Config(value)
     }
 }
 
-impl From<tungstenite::Error> for RuntimeError {
-    fn from(value: tungstenite::Error) -> Self {
-        Self::WebSocket(value)
-    }
-}
-
-impl From<serde_json::Error> for RuntimeError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
-    }
-}
-
 impl From<crate::fix::coinbase::auth::CoinbaseAuthError> for RuntimeError {
     fn from(value: crate::fix::coinbase::auth::CoinbaseAuthError) -> Self {
         Self::Auth(value)
+    }
+}
+
+impl From<crate::fix::FixError> for RuntimeError {
+    fn from(value: crate::fix::FixError) -> Self {
+        Self::Fix(value)
+    }
+}
+
+impl From<crate::fix::coinbase::market_data::MarketDataError> for RuntimeError {
+    fn from(value: crate::fix::coinbase::market_data::MarketDataError) -> Self {
+        Self::MarketData(value)
+    }
+}
+
+impl From<crate::account::AccountParseError> for RuntimeError {
+    fn from(value: crate::account::AccountParseError) -> Self {
+        Self::Account(value)
+    }
+}
+
+impl From<time::error::Format> for RuntimeError {
+    fn from(value: time::error::Format) -> Self {
+        Self::Time(value)
     }
 }
 
@@ -155,67 +187,22 @@ pub fn run(opts: RuntimeOptions) -> Result<(), RuntimeError> {
         return Ok(());
     }
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let mut handles = Vec::new();
-    let credentials = match credentials_from_env(&config) {
-        Ok(credentials) => Some(credentials),
-        Err(err) if opts.account && !opts.market_data => return Err(err),
-        Err(err) => {
-            eprintln!("[account] credentials not loaded: {err}");
-            eprintln!(
-                "[account] public market data still works; set the configured API key/secret/passphrase env vars to enable REST assets, user order/fill feed, and authenticated level2 depth"
-            );
-            None
-        }
-    };
-
-    if opts.market_data {
-        let products = product_ids(&config);
-        let env_name = config.coinbase.environment.clone();
-        let once = opts.once;
-        let shutdown = shutdown.clone();
-        let market_credentials = credentials.clone();
-        handles.push((
-            "market-data",
-            thread::Builder::new()
-                .name("cb-ws-market-data".to_string())
-                .spawn(move || {
-                    run_market_ws(&env_name, &products, market_credentials, once, shutdown)
-                })?,
-        ));
-    }
+    let credentials = credentials_from_env(&config)?;
 
     if opts.account {
-        if let Some(credentials) = credentials {
-            print_accounts_snapshot(&config, &credentials)?;
-            let products = product_ids(&config);
-            let env_name = config.coinbase.environment.clone();
-            let once = opts.once;
-            let shutdown = shutdown.clone();
-            handles.push((
-                "user-feed",
-                thread::Builder::new()
-                    .name("cb-ws-user-feed".to_string())
-                    .spawn(move || {
-                        run_authenticated_user_ws(&env_name, &products, credentials, once, shutdown)
-                    })?,
-            ));
-        }
+        print_accounts_snapshot(&config, &credentials)?;
     }
 
-    for (name, handle) in handles {
-        let result = handle.join().map_err(|_| RuntimeError::ThreadPanic(name))?;
-        if let Err(err) = result {
-            shutdown.store(true, Ordering::SeqCst);
-            return Err(err);
-        }
+    if opts.market_data {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        run_fix_market_data(&config, &credentials, opts.once, shutdown)?;
     }
 
     Ok(())
 }
 
 fn usage() -> String {
-    "Usage: cb-hft [--config PATH] [--dry-run] [--once] [--market-data-only|--account-only] [--no-market-data] [--no-account]".to_string()
+    "Usage: cb-hft [--config PATH] [--dry-run] [--once] [--market-data-only|--account-only|--with-account] [--no-market-data] [--no-account]".to_string()
 }
 
 fn print_startup_summary(opts: &RuntimeOptions, config: &AppConfig) {
@@ -223,7 +210,7 @@ fn print_startup_summary(opts: &RuntimeOptions, config: &AppConfig) {
     println!("[runtime] environment={}", config.coinbase.environment);
     println!("[runtime] products={}", product_ids(config).join(","));
     println!(
-        "[runtime] market_data={} account={} once={} dry_run={}",
+        "[runtime] fix_market_data={} rest_account={} once={} dry_run={}",
         opts.market_data, opts.account, opts.once, opts.dry_run
     );
 }
@@ -240,15 +227,12 @@ fn credentials_from_env(config: &AppConfig) -> Result<CoinbaseCredentials, Runti
     let mut missing = Vec::new();
     let api_key = env::var(&config.coinbase.api_key_env).map_err(|_| {
         missing.push(config.coinbase.api_key_env.clone());
-        ()
     });
     let secret = env::var(&config.coinbase.api_secret_env).map_err(|_| {
         missing.push(config.coinbase.api_secret_env.clone());
-        ()
     });
     let passphrase = env::var(&config.coinbase.passphrase_env).map_err(|_| {
         missing.push(config.coinbase.passphrase_env.clone());
-        ()
     });
 
     if !missing.is_empty() {
@@ -262,11 +246,11 @@ fn credentials_from_env(config: &AppConfig) -> Result<CoinbaseCredentials, Runti
     ))
 }
 
-fn ws_url(environment: &str) -> &'static str {
+fn fix_md_host(environment: &str) -> &'static str {
     if environment.eq_ignore_ascii_case("prod") || environment.eq_ignore_ascii_case("production") {
-        "wss://ws-feed.exchange.coinbase.com"
+        "fix-md.exchange.coinbase.com"
     } else {
-        "wss://ws-feed-public.sandbox.exchange.coinbase.com"
+        "fix-md.sandbox.exchange.coinbase.com"
     }
 }
 
@@ -285,102 +269,196 @@ fn timestamp_secs() -> String {
     format!("{}.{:03}", now.as_secs(), now.subsec_millis())
 }
 
-fn run_market_ws(
-    environment: &str,
-    products: &[String],
-    credentials: Option<CoinbaseCredentials>,
+fn fix_sending_time() -> Result<String, RuntimeError> {
+    Ok(OffsetDateTime::now_utc().format(FIX_TIMESTAMP_FORMAT)?)
+}
+
+fn recv_ts_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn run_fix_market_data(
+    config: &AppConfig,
+    credentials: &CoinbaseCredentials,
     once: bool,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), RuntimeError> {
-    let url = ws_url(environment);
-    println!("[market] connecting {url}");
-    let (mut socket, _) = connect(url)?;
-    let product_values: Vec<Value> = products.iter().cloned().map(Value::String).collect();
-    let subscribe = if let Some(credentials) = credentials.as_ref() {
-        let timestamp = timestamp_secs();
-        let product_refs: Vec<&str> = products.iter().map(String::as_str).collect();
-        let signed = CoinbaseAuth::websocket_subscribe_json(
-            credentials,
-            &timestamp,
-            &["ticker", "matches", "level2"],
-            &product_refs,
-        )?;
-        serde_json::from_str::<Value>(&signed)?
-    } else {
-        serde_json::json!({
-            "type": "subscribe",
-            "product_ids": product_values,
-            "channels": ["ticker", "matches"]
-        })
-    };
-    socket.send(Message::Text(subscribe.to_string()))?;
-    if credentials.is_some() {
-        println!("[market] subscribed authenticated ticker,matches,level2");
-    } else {
-        println!(
-            "[market] subscribed public ticker,matches; level2 depth requires Coinbase authentication"
-        );
+    let host = fix_md_host(&config.coinbase.environment);
+    let addr = format!("{host}:6121");
+    println!("[market.fix] connecting tcp+ssl://{addr} (Snapshot Enabled Gateway)");
+
+    let tcp = TcpStream::connect(&addr)?;
+    tcp.set_nodelay(true)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let connector = TlsConnector::new()?;
+    let mut stream = connector
+        .connect(host, tcp)
+        .map_err(|err| RuntimeError::Protocol(format!("tls handshake failed: {err}")))?;
+
+    let encoder = FixEncoder::new("FIXT.1.1", &credentials.api_key, "Coinbase");
+    let parser = FixParser::default();
+    let mut sender_seq = 1u64;
+
+    let logon_time = fix_sending_time()?;
+    let logon = encoder.encode_coinbase_logon(sender_seq, &logon_time, 10, credentials, false)?;
+    sender_seq += 1;
+    stream.write_all(&logon)?;
+    stream.flush()?;
+    println!("[market.fix] sent Logon 35=A MsgSeqNum=1 TargetCompID=Coinbase");
+
+    let mut subscribed = false;
+    let mut read_buf = [0u8; 8192];
+    let mut pending = Vec::<u8>::with_capacity(64 * 1024);
+    let mut printed = 0usize;
+    let mut l1_books = vec![L1Book::default(); config.products.len()];
+
+    while !shutdown.load(Ordering::SeqCst) {
+        let n = stream.read(&mut read_buf)?;
+        if n == 0 {
+            return Err(RuntimeError::Protocol(
+                "FIX market data connection closed".to_string(),
+            ));
+        }
+        pending.extend_from_slice(&read_buf[..n]);
+
+        loop {
+            let Some((frame, consumed)) = parser.next_frame(&pending)? else {
+                break;
+            };
+
+            match frame.msg_type {
+                MsgType::Logon => {
+                    println!("[market.fix] received Logon 35=A; subscribing L1 depth + trades");
+                    if !subscribed {
+                        let symbols: Vec<&str> = config
+                            .products
+                            .iter()
+                            .map(|product| product.spec.coinbase_product)
+                            .collect();
+                        let md_req = encoder.encode_market_data_request_with_depth(
+                            sender_seq,
+                            &fix_sending_time()?,
+                            "cb-hft-l1-trades",
+                            1,
+                            &symbols,
+                        );
+                        sender_seq += 1;
+                        stream.write_all(&md_req)?;
+                        stream.flush()?;
+                        subscribed = true;
+                        println!(
+                            "[market.fix] sent MarketDataRequest 35=V 263=1 264=1 symbols={}",
+                            symbols.join(",")
+                        );
+                    }
+                }
+                MsgType::TestRequest => {
+                    let heartbeat = encoder.encode_heartbeat(
+                        sender_seq,
+                        &fix_sending_time()?,
+                        test_req_id(&parser, &frame),
+                    );
+                    sender_seq += 1;
+                    stream.write_all(&heartbeat)?;
+                    stream.flush()?;
+                }
+                MsgType::Heartbeat => {}
+                MsgType::MarketDataSnapshotFullRefresh | MsgType::MarketDataIncrementalRefresh => {
+                    let symbol = symbol_from_frame(&parser, &frame).ok_or_else(|| {
+                        RuntimeError::Protocol("market data message missing Symbol(55)".to_string())
+                    })?;
+                    let (idx, spec) = product_by_symbol(config, symbol).ok_or_else(|| {
+                        RuntimeError::Protocol(format!(
+                            "market data message for unconfigured symbol {symbol}"
+                        ))
+                    })?;
+                    let events = parse_market_data(&parser, &frame, spec, recv_ts_ns())?;
+                    for event in events {
+                        print_market_event(event, &mut l1_books[idx]);
+                        printed += 1;
+                    }
+                    if once && printed >= 5 {
+                        shutdown.store(true, Ordering::SeqCst);
+                    }
+                }
+                other => {
+                    println!("[market.fix] received {other:?}");
+                }
+            }
+
+            pending.drain(..consumed);
+        }
     }
 
-    let mut printed = 0usize;
-    while !shutdown.load(Ordering::SeqCst) {
-        let message = socket.read()?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            print_market_message(&value);
-        } else {
-            println!("[market.raw] {text}");
-        }
-        printed += 1;
-        if once && printed >= 5 {
-            shutdown.store(true, Ordering::SeqCst);
-            break;
-        }
-    }
     Ok(())
 }
 
-fn run_authenticated_user_ws(
-    environment: &str,
-    products: &[String],
-    credentials: CoinbaseCredentials,
-    once: bool,
-    shutdown: Arc<AtomicBool>,
-) -> Result<(), RuntimeError> {
-    let url = ws_url(environment);
-    println!("[user] connecting {url}");
-    let (mut socket, _) = connect(url)?;
-    let timestamp = timestamp_secs();
-    let product_refs: Vec<&str> = products.iter().map(String::as_str).collect();
-    let subscribe = CoinbaseAuth::websocket_subscribe_json(
-        &credentials,
-        &timestamp,
-        &["user", "full"],
-        &product_refs,
-    )?;
-    socket.send(Message::Text(subscribe))?;
-    println!("[user] subscribed user/full channel");
+fn test_req_id<'a>(parser: &FixParser, frame: &'a crate::fix::FixFrame<'a>) -> Option<&'a str> {
+    parser
+        .fields(frame)
+        .find(|field| field.tag == 112)
+        .and_then(|field| std::str::from_utf8(field.value).ok())
+}
 
-    let mut printed = 0usize;
-    while !shutdown.load(Ordering::SeqCst) {
-        let message = socket.read()?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            print_user_message(&value);
-        } else {
-            println!("[user.raw] {text}");
+fn symbol_from_frame<'a>(
+    parser: &FixParser,
+    frame: &'a crate::fix::FixFrame<'a>,
+) -> Option<&'a str> {
+    parser
+        .fields(frame)
+        .find(|field| field.tag == 55)
+        .and_then(|field| std::str::from_utf8(field.value).ok())
+}
+
+fn product_by_symbol<'a>(config: &'a AppConfig, symbol: &str) -> Option<(usize, &'a ProductSpec)> {
+    config
+        .products
+        .iter()
+        .enumerate()
+        .find(|(_, product)| product.spec.coinbase_product == symbol)
+        .map(|(idx, product): (usize, &ProductConfig)| (idx, &product.spec))
+}
+
+fn print_market_event(event: MarketEvent, book: &mut L1Book) {
+    match event {
+        MarketEvent::L1 {
+            symbol_id,
+            recv_ts_ns,
+            bid_px,
+            bid_qty,
+            ask_px,
+            ask_qty,
+            sequence,
+        } => {
+            book.apply(L1Update {
+                symbol_id,
+                exchange_ts_ns: 0,
+                recv_ts_ns,
+                bid_px,
+                bid_qty,
+                ask_px,
+                ask_qty,
+                sequence,
+            });
+            println!(
+                "[market.fix.l1] symbol_id={} bid_px={} bid_qty={} ask_px={} ask_qty={} seq={} recv_ts_ns={}",
+                symbol_id.0, bid_px.0, bid_qty.0, ask_px.0, ask_qty.0, sequence, recv_ts_ns
+            );
         }
-        printed += 1;
-        if once && printed >= 5 {
-            shutdown.store(true, Ordering::SeqCst);
-            break;
-        }
+        MarketEvent::Trade(trade) => println!(
+            "[market.fix.trade] symbol_id={} trade_id={} price={} qty={} seq={} recv_ts_ns={}",
+            trade.symbol_id.0,
+            trade.trade_id,
+            trade.price.0,
+            trade.qty.0,
+            trade.sequence,
+            trade.recv_ts_ns
+        ),
     }
-    Ok(())
 }
 
 fn print_accounts_snapshot(
@@ -404,144 +482,17 @@ fn print_accounts_snapshot(
     let body = response
         .into_string()
         .map_err(|err| RuntimeError::Http(err.to_string()))?;
-    let value: Value = serde_json::from_str(&body)?;
-    print_account_snapshot_value(&value);
-    Ok(())
-}
-
-fn print_market_message(value: &Value) {
-    let typ = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    match typ {
-        "ticker" => println!(
-            "[market.l1] product={} bid={} bid_size={} ask={} ask_size={} price={} time={} seq={}",
-            str_field(value, "product_id"),
-            str_field(value, "best_bid"),
-            str_field(value, "best_bid_size"),
-            str_field(value, "best_ask"),
-            str_field(value, "best_ask_size"),
-            str_field(value, "price"),
-            str_field(value, "time"),
-            value
-                .get("sequence")
-                .map(Value::to_string)
-                .unwrap_or_default(),
-        ),
-        "match" | "last_match" => println!(
-            "[market.trade] product={} side={} price={} size={} trade_id={} time={} seq={}",
-            str_field(value, "product_id"),
-            str_field(value, "side"),
-            str_field(value, "price"),
-            str_field(value, "size"),
-            value
-                .get("trade_id")
-                .map(Value::to_string)
-                .unwrap_or_default(),
-            str_field(value, "time"),
-            value
-                .get("sequence")
-                .map(Value::to_string)
-                .unwrap_or_default(),
-        ),
-        "snapshot" => println!(
-            "[market.depth.snapshot] product={} bids={} asks={}",
-            str_field(value, "product_id"),
-            value
-                .get("bids")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len),
-            value
-                .get("asks")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len),
-        ),
-        "l2update" => println!(
-            "[market.depth.update] product={} changes={} time={}",
-            str_field(value, "product_id"),
-            value
-                .get("changes")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len),
-            str_field(value, "time"),
-        ),
-        "subscriptions" => println!("[market.subscriptions] {value}"),
-        "error" => eprintln!("[market.error] {value}"),
-        _ => println!("[market.{typ}] {value}"),
-    }
-}
-
-fn print_user_message(value: &Value) {
-    let typ = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    match typ {
-        "open" | "done" | "received" | "change" => println!(
-            "[user.order] type={} product={} order_id={} client_oid={} side={} price={} size={} remaining={} reason={} seq={}",
-            typ,
-            str_field(value, "product_id"),
-            str_field(value, "order_id"),
-            str_field(value, "client_oid"),
-            str_field(value, "side"),
-            str_field(value, "price"),
-            str_field(value, "size"),
-            str_field(value, "remaining_size"),
-            str_field(value, "reason"),
-            value
-                .get("sequence")
-                .map(Value::to_string)
-                .unwrap_or_default(),
-        ),
-        "match" => println!(
-            "[user.fill] product={} trade_id={} maker_order_id={} taker_order_id={} side={} price={} size={} fee={} seq={}",
-            str_field(value, "product_id"),
-            value
-                .get("trade_id")
-                .map(Value::to_string)
-                .unwrap_or_default(),
-            str_field(value, "maker_order_id"),
-            str_field(value, "taker_order_id"),
-            str_field(value, "side"),
-            str_field(value, "price"),
-            str_field(value, "size"),
-            str_field(value, "taker_fee_rate"),
-            value
-                .get("sequence")
-                .map(Value::to_string)
-                .unwrap_or_default(),
-        ),
-        "subscriptions" => println!("[user.subscriptions] {value}"),
-        "error" => eprintln!("[user.error] {value}"),
-        _ => println!("[user.{typ}] {value}"),
-    }
-}
-
-fn print_account_snapshot_value(value: &Value) {
-    let Some(accounts) = value.as_array() else {
-        println!("[account.assets.raw] {value}");
-        return;
-    };
-    println!("[account.assets] count={}", accounts.len());
-    for account in accounts {
+    let snapshot =
+        parse_rest_accounts_snapshot(body.as_bytes(), 10_000_000_000_000_000, recv_ts_ns())?;
+    for balance in snapshot.balances() {
         println!(
-            "[account.asset] currency={} balance={} available={} hold={} id={}",
-            str_field(account, "currency"),
-            str_field(account, "balance"),
-            str_field(account, "available"),
-            str_field(account, "hold"),
-            str_field(account, "id"),
+            "[account.balance] asset={} total={} available={} hold={} recv_ts_ns={}",
+            balance.asset_id.as_str(),
+            balance.total.0,
+            balance.available.0,
+            balance.hold.0,
+            balance.recv_ts_ns
         );
     }
-}
-
-fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
-    value.get(key).and_then(Value::as_str).unwrap_or("")
-}
-
-pub fn sleep_forever() {
-    loop {
-        thread::sleep(Duration::from_secs(3600));
-    }
+    Ok(())
 }
