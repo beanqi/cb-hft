@@ -8,6 +8,7 @@ pub mod market;
 pub mod net;
 pub mod order;
 pub mod ring;
+pub mod runtime;
 pub mod strategy;
 pub mod supervisor;
 pub mod telemetry;
