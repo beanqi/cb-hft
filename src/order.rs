@@ -459,6 +459,14 @@ impl OrderThreadEngine {
         &self.manager
     }
 
+    pub fn next_seq_num(&self) -> u64 {
+        self.next_seq_num
+    }
+
+    pub fn set_next_seq_num(&mut self, next_seq_num: u64) {
+        self.next_seq_num = next_seq_num;
+    }
+
     fn product(&self, symbol_id: SymbolId) -> Option<&ProductSpec> {
         self.products
             .iter()

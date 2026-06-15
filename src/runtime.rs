@@ -1,10 +1,12 @@
 use std::env;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, Sender, TryRecvError},
 };
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use native_tls::TlsConnector;
@@ -16,9 +18,10 @@ use crate::event::ExchangeEvent;
 use crate::fix::coinbase::auth::{CoinbaseAuth, CoinbaseCredentials};
 use crate::fix::coinbase::market_data::parse_market_data;
 use crate::fix::{FixEncoder, FixParser, MsgType};
-use crate::market::{L1Book, L1Update, MarketEvent};
-use crate::order::{OrderManager, OrderThreadEngine};
-use crate::types::ProductSpec;
+use crate::market::{L1Book, L1Update, MarketEngine, MarketEvent};
+use crate::order::{OrderManager, OrderThreadAction, OrderThreadEngine, StrategyCommand};
+use crate::strategy::{NoopStrategy, Strategy};
+use crate::types::{ProductSpec, SymbolId};
 
 const FIX_TIMESTAMP_FORMAT: &[FormatItem<'_>] =
     format_description!("[year][month][day]-[hour]:[minute]:[second].[subsecond digits:3]");
@@ -185,6 +188,201 @@ impl From<time::error::Format> for RuntimeError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimePipelineConfig {
+    command_capacity: usize,
+    exchange_event_capacity: usize,
+}
+
+impl RuntimePipelineConfig {
+    pub fn new(
+        _products: Vec<ProductSpec>,
+        command_capacity: usize,
+        exchange_event_capacity: usize,
+    ) -> Result<Self, RuntimeError> {
+        if command_capacity == 0 || exchange_event_capacity == 0 {
+            return Err(RuntimeError::Protocol(
+                "runtime pipeline ring capacities must be non-zero".to_string(),
+            ));
+        }
+        Ok(Self {
+            command_capacity,
+            exchange_event_capacity,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimePipelineStep {
+    MarketEventRouted { symbol_id: SymbolId },
+    ExchangeEventRouted { symbol_id: Option<SymbolId> },
+    StrategyCommandRouted { symbol_id: SymbolId },
+    OrderAction(OrderThreadAction),
+    CommandDropped { symbol_id: SymbolId },
+    ExchangeEventDropped { symbol_id: Option<SymbolId> },
+}
+
+pub struct RuntimePipeline<S = Box<dyn Strategy + Send>> {
+    strategy_engines: Vec<MarketEngine<S>>,
+    order_engine: OrderThreadEngine,
+    command_tx: Sender<StrategyCommand>,
+    command_rx: Receiver<StrategyCommand>,
+    exchange_event_tx: Sender<ExchangeEvent>,
+    exchange_event_rx: Receiver<ExchangeEvent>,
+}
+
+impl<S: Strategy> RuntimePipeline<S> {
+    pub fn new(
+        config: RuntimePipelineConfig,
+        strategies: Vec<S>,
+        order_engine: OrderThreadEngine,
+    ) -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (exchange_event_tx, exchange_event_rx) = mpsc::channel();
+        let strategy_engines = strategies
+            .into_iter()
+            .enumerate()
+            .map(|(idx, strategy)| MarketEngine::new(SymbolId(idx as u16), strategy))
+            .collect();
+        let _ = config.command_capacity;
+        let _ = config.exchange_event_capacity;
+        Self {
+            strategy_engines,
+            order_engine,
+            command_tx,
+            command_rx,
+            exchange_event_tx,
+            exchange_event_rx,
+        }
+    }
+
+    pub fn on_market_events(
+        &mut self,
+        events: Vec<MarketEvent>,
+        sending_time: &str,
+    ) -> Vec<RuntimePipelineStep> {
+        let mut steps = Vec::new();
+        for event in events {
+            let Some(symbol_id) = market_event_symbol_id(&event) else {
+                continue;
+            };
+            if let Some(engine) = self.strategy_engines.get_mut(symbol_id.0 as usize) {
+                let commands = engine.on_market_event(event);
+                steps.push(RuntimePipelineStep::MarketEventRouted { symbol_id });
+                for command in commands {
+                    if self.command_tx.send(command).is_ok() {
+                        steps.push(RuntimePipelineStep::StrategyCommandRouted {
+                            symbol_id: command.symbol_id(),
+                        });
+                    } else {
+                        steps.push(RuntimePipelineStep::CommandDropped {
+                            symbol_id: command.symbol_id(),
+                        });
+                    }
+                }
+            }
+        }
+        self.drain_commands(sending_time, &mut steps);
+        steps
+    }
+
+    pub fn on_exchange_events(
+        &mut self,
+        events: Vec<ExchangeEvent>,
+        sending_time: &str,
+    ) -> Vec<RuntimePipelineStep> {
+        let mut steps = Vec::new();
+        for event in events {
+            let symbol_id = event.symbol_id();
+            if self.exchange_event_tx.send(event).is_ok() {
+                steps.push(RuntimePipelineStep::ExchangeEventRouted { symbol_id });
+            } else {
+                steps.push(RuntimePipelineStep::ExchangeEventDropped { symbol_id });
+            }
+        }
+        self.drain_exchange_events(&mut steps);
+        self.drain_commands(sending_time, &mut steps);
+        steps
+    }
+
+    pub fn command_sender(&self) -> Sender<StrategyCommand> {
+        self.command_tx.clone()
+    }
+
+    pub fn exchange_event_sender(&self) -> Sender<ExchangeEvent> {
+        self.exchange_event_tx.clone()
+    }
+
+    pub fn order_engine(&self) -> &OrderThreadEngine {
+        &self.order_engine
+    }
+
+    fn drain_exchange_events(&mut self, steps: &mut Vec<RuntimePipelineStep>) {
+        loop {
+            match self.exchange_event_rx.try_recv() {
+                Ok(event) => {
+                    let symbol_id = event.symbol_id();
+                    match symbol_id {
+                        Some(symbol_id) => {
+                            if let Some(engine) =
+                                self.strategy_engines.get_mut(symbol_id.0 as usize)
+                            {
+                                for command in engine.on_exchange_event(event) {
+                                    if self.command_tx.send(command).is_ok() {
+                                        steps.push(RuntimePipelineStep::StrategyCommandRouted {
+                                            symbol_id: command.symbol_id(),
+                                        });
+                                    } else {
+                                        steps.push(RuntimePipelineStep::CommandDropped {
+                                            symbol_id: command.symbol_id(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            for engine in &mut self.strategy_engines {
+                                for command in engine.on_exchange_event(event.clone()) {
+                                    if self.command_tx.send(command).is_ok() {
+                                        steps.push(RuntimePipelineStep::StrategyCommandRouted {
+                                            symbol_id: command.symbol_id(),
+                                        });
+                                    } else {
+                                        steps.push(RuntimePipelineStep::CommandDropped {
+                                            symbol_id: command.symbol_id(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn drain_commands(&mut self, sending_time: &str, steps: &mut Vec<RuntimePipelineStep>) {
+        loop {
+            match self.command_rx.try_recv() {
+                Ok(command) => {
+                    for action in self.order_engine.on_command(command, sending_time) {
+                        steps.push(RuntimePipelineStep::OrderAction(action));
+                    }
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+}
+
+fn market_event_symbol_id(event: &MarketEvent) -> Option<SymbolId> {
+    match event {
+        MarketEvent::L1 { symbol_id, .. } => Some(*symbol_id),
+        MarketEvent::Trade(trade) => Some(trade.symbol_id),
+    }
+}
+
 pub fn run_from_env() -> Result<(), RuntimeError> {
     let opts = RuntimeOptions::parse_args(env::args().skip(1))?;
     run(opts)
@@ -206,14 +404,14 @@ pub fn run(opts: RuntimeOptions) -> Result<(), RuntimeError> {
         print_accounts_snapshot(&config, &credentials)?;
     }
 
-    if opts.market_data {
+    if opts.market_data && opts.order_entry {
+        run_live_pipeline(&config, &credentials, opts.once)?;
+    } else if opts.market_data {
         let shutdown = Arc::new(AtomicBool::new(false));
-        run_fix_market_data(&config, &credentials, opts.once, shutdown)?;
-    }
-
-    if opts.order_entry {
+        run_fix_market_data(&config, &credentials, opts.once, shutdown, None)?;
+    } else if opts.order_entry {
         let shutdown = Arc::new(AtomicBool::new(false));
-        run_fix_order_entry(&config, &credentials, opts.once, shutdown)?;
+        run_fix_order_entry(&config, &credentials, opts.once, shutdown, None, None)?;
     }
 
     Ok(())
@@ -307,11 +505,142 @@ fn recv_ts_ns() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+fn run_live_pipeline(
+    config: &AppConfig,
+    credentials: &CoinbaseCredentials,
+    once: bool,
+) -> Result<(), RuntimeError> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (market_tx, market_rx) = mpsc::channel::<MarketEvent>();
+    let (command_tx, command_rx) = mpsc::channel::<StrategyCommand>();
+    let (exchange_event_tx, exchange_event_rx) = mpsc::channel::<ExchangeEvent>();
+
+    let strategy_products: Vec<_> = config.products.iter().map(|product| product.spec).collect();
+    let strategy_shutdown = Arc::clone(&shutdown);
+    let strategy_handle = thread::spawn(move || {
+        run_strategy_threads(
+            strategy_products,
+            market_rx,
+            command_tx,
+            exchange_event_rx,
+            strategy_shutdown,
+        )
+    });
+
+    let order_config = config.clone();
+    let order_credentials = credentials.clone();
+    let order_shutdown = Arc::clone(&shutdown);
+    let order_handle = thread::spawn(move || {
+        run_fix_order_entry(
+            &order_config,
+            &order_credentials,
+            false,
+            order_shutdown,
+            Some(command_rx),
+            Some(exchange_event_tx),
+        )
+    });
+
+    let market_config = config.clone();
+    let market_credentials = credentials.clone();
+    let market_shutdown = Arc::clone(&shutdown);
+    let market_handle = thread::spawn(move || {
+        run_fix_market_data(
+            &market_config,
+            &market_credentials,
+            once,
+            market_shutdown,
+            Some(market_tx),
+        )
+    });
+
+    let market_result = join_runtime_thread("market", market_handle)?;
+    shutdown.store(true, Ordering::SeqCst);
+
+    join_runtime_thread("strategy", strategy_handle)?;
+    join_runtime_thread("order", order_handle)??;
+    market_result
+}
+
+fn run_strategy_threads(
+    products: Vec<ProductSpec>,
+    market_rx: Receiver<MarketEvent>,
+    command_tx: Sender<StrategyCommand>,
+    exchange_event_rx: Receiver<ExchangeEvent>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut engines: Vec<MarketEngine<NoopStrategy>> = products
+        .iter()
+        .map(|spec| MarketEngine::new(spec.symbol_id, NoopStrategy))
+        .collect();
+
+    while !shutdown.load(Ordering::SeqCst) {
+        match market_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(event) => route_market_to_strategy(&mut engines, event, &command_tx),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        loop {
+            match exchange_event_rx.try_recv() {
+                Ok(event) => route_exchange_to_strategy(&mut engines, event, &command_tx),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+}
+
+fn route_market_to_strategy(
+    engines: &mut [MarketEngine<NoopStrategy>],
+    event: MarketEvent,
+    command_tx: &Sender<StrategyCommand>,
+) {
+    let Some(symbol_id) = market_event_symbol_id(&event) else {
+        return;
+    };
+    if let Some(engine) = engines.get_mut(symbol_id.0 as usize) {
+        for command in engine.on_market_event(event) {
+            let _ = command_tx.send(command);
+        }
+    }
+}
+
+fn route_exchange_to_strategy(
+    engines: &mut [MarketEngine<NoopStrategy>],
+    event: ExchangeEvent,
+    command_tx: &Sender<StrategyCommand>,
+) {
+    match event.symbol_id() {
+        Some(symbol_id) => {
+            if let Some(engine) = engines.get_mut(symbol_id.0 as usize) {
+                for command in engine.on_exchange_event(event) {
+                    let _ = command_tx.send(command);
+                }
+            }
+        }
+        None => {
+            for engine in engines {
+                for command in engine.on_exchange_event(event.clone()) {
+                    let _ = command_tx.send(command);
+                }
+            }
+        }
+    }
+}
+
+fn join_runtime_thread<T>(name: &str, handle: thread::JoinHandle<T>) -> Result<T, RuntimeError> {
+    handle
+        .join()
+        .map_err(|_| RuntimeError::Protocol(format!("{name} thread panicked")))
+}
+
 fn run_fix_market_data(
     config: &AppConfig,
     credentials: &CoinbaseCredentials,
     once: bool,
     shutdown: Arc<AtomicBool>,
+    market_event_tx: Option<Sender<MarketEvent>>,
 ) -> Result<(), RuntimeError> {
     let host = fix_md_host(&config.coinbase.environment);
     let addr = format!("{host}:6121");
@@ -405,6 +734,13 @@ fn run_fix_market_data(
                     let events = parse_market_data(&parser, &frame, spec, recv_ts_ns())?;
                     for event in events {
                         print_market_event(event, &mut l1_books[idx]);
+                        if let Some(tx) = &market_event_tx {
+                            if tx.send(event).is_err() {
+                                return Err(RuntimeError::Protocol(
+                                    "market pipeline receiver disconnected".to_string(),
+                                ));
+                            }
+                        }
                         printed += 1;
                     }
                     if once && printed >= 5 {
@@ -428,6 +764,8 @@ fn run_fix_order_entry(
     credentials: &CoinbaseCredentials,
     once: bool,
     shutdown: Arc<AtomicBool>,
+    command_rx: Option<Receiver<StrategyCommand>>,
+    exchange_event_tx: Option<Sender<ExchangeEvent>>,
 ) -> Result<(), RuntimeError> {
     let host = fix_ord_host(&config.coinbase.environment);
     let addr = format!("{host}:6121");
@@ -451,6 +789,7 @@ fn run_fix_order_entry(
     let logon_time = fix_sending_time()?;
     let logon = encoder.encode_coinbase_logon(sender_seq, &logon_time, 10, credentials, true)?;
     sender_seq += 1;
+    order_engine.set_next_seq_num(sender_seq);
     stream.write_all(&logon)?;
     stream.flush()?;
     println!("[order.fix] sent Logon 35=A MsgSeqNum=1 TargetCompID=CBSE CancelOnDisconnect=Y");
@@ -460,11 +799,49 @@ fn run_fix_order_entry(
     let mut printed = 0usize;
 
     while !shutdown.load(Ordering::SeqCst) {
-        let n = stream.read(&mut read_buf)?;
-        if n == 0 {
+        if let Some(rx) = &command_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(command) => {
+                        let actions = order_engine.on_command(command, &fix_sending_time()?);
+                        for action in actions {
+                            match action {
+                                OrderThreadAction::SendFix(bytes) => {
+                                    stream.write_all(&bytes)?;
+                                    stream.flush()?;
+                                    println!(
+                                        "[order.fix] sent order command raw_len={}",
+                                        bytes.len()
+                                    );
+                                }
+                                OrderThreadAction::Reject(err) => {
+                                    println!("[order.fix.reject] {err:?}");
+                                }
+                            }
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        return Err(RuntimeError::Protocol(
+                            "strategy command sender disconnected".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let n = match stream.read(&mut read_buf) {
+            Ok(n) => n,
+            Err(err) if command_rx.is_some() && is_read_timeout(&err) => 0,
+            Err(err) => return Err(RuntimeError::Io(err)),
+        };
+        if n == 0 && command_rx.is_none() {
             return Err(RuntimeError::Protocol(
                 "FIX order-entry connection closed".to_string(),
             ));
+        }
+        if n == 0 {
+            continue;
         }
         pending.extend_from_slice(&read_buf[..n]);
 
@@ -498,7 +875,14 @@ fn run_fix_order_entry(
                             RuntimeError::Protocol(format!("order report parse error: {err:?}"))
                         })?;
                     for event in events {
-                        print_order_exchange_event(event);
+                        print_order_exchange_event(event.clone());
+                        if let Some(tx) = &exchange_event_tx {
+                            if tx.send(event).is_err() {
+                                return Err(RuntimeError::Protocol(
+                                    "strategy exchange-event receiver disconnected".to_string(),
+                                ));
+                            }
+                        }
                         printed += 1;
                     }
                     if once && printed > 0 {
@@ -538,6 +922,10 @@ fn symbol_from_frame<'a>(
         .fields(frame)
         .find(|field| field.tag == 55)
         .and_then(|field| std::str::from_utf8(field.value).ok())
+}
+
+fn is_read_timeout(err: &std::io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 fn product_by_symbol<'a>(config: &'a AppConfig, symbol: &str) -> Option<(usize, &'a ProductSpec)> {

@@ -11,6 +11,28 @@ pub trait Strategy {
     fn on_balance_event(&mut self, _ctx: &mut StrategyContext<'_>, _event: &BalanceEvent) {}
 }
 
+impl<T: Strategy + ?Sized> Strategy for Box<T> {
+    fn on_l1(&mut self, ctx: &mut StrategyContext<'_>, book: &L1Book) {
+        (**self).on_l1(ctx, book);
+    }
+
+    fn on_trade(&mut self, ctx: &mut StrategyContext<'_>, trade: &Trade) {
+        (**self).on_trade(ctx, trade);
+    }
+
+    fn on_order_event(&mut self, ctx: &mut StrategyContext<'_>, event: &OrderEvent) {
+        (**self).on_order_event(ctx, event);
+    }
+
+    fn on_fill_event(&mut self, ctx: &mut StrategyContext<'_>, event: &FillEvent) {
+        (**self).on_fill_event(ctx, event);
+    }
+
+    fn on_balance_event(&mut self, ctx: &mut StrategyContext<'_>, event: &BalanceEvent) {
+        (**self).on_balance_event(ctx, event);
+    }
+}
+
 pub struct StrategyContext<'a> {
     symbol_id: SymbolId,
     now_ns: u64,
