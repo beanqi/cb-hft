@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::fix::FixEncoder;
+use crate::event::{ExchangeEvent, FillEvent};
+use crate::fix::coinbase::order_entry::{OrderEntryError, parse_execution_report};
+use crate::fix::{FixEncoder, FixFrame, FixParser};
 use crate::types::{Price, ProductSpec, ProductValidationError, Qty, Side, SymbolId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -416,6 +418,43 @@ impl OrderThreadEngine {
         vec![OrderThreadAction::SendFix(fix)]
     }
 
+    pub fn on_execution_report(
+        &mut self,
+        parser: &FixParser,
+        frame: &FixFrame<'_>,
+        recv_ts_ns: u64,
+    ) -> Result<Vec<ExchangeEvent>, OrderEntryError> {
+        let symbol = fix_symbol(parser, frame).ok_or(OrderEntryError::MissingSymbol)?;
+        let Some(spec) = self.product_by_coinbase_symbol(symbol).copied() else {
+            return Err(OrderEntryError::UnknownSymbol);
+        };
+        let order_event = parse_execution_report(parser, frame, &spec, recv_ts_ns)?;
+        let is_new = self.manager.apply_order_event(order_event.clone());
+        if !is_new {
+            return Ok(Vec::new());
+        }
+
+        let mut events = Vec::with_capacity(if order_event.last_fill_qty.0 > 0 {
+            2
+        } else {
+            1
+        });
+        events.push(ExchangeEvent::Order(order_event.clone()));
+        if order_event.last_fill_qty.0 > 0 {
+            events.push(ExchangeEvent::Fill(FillEvent {
+                symbol_id: order_event.symbol_id,
+                client_order_id: order_event.client_order_id,
+                exchange_order_id: order_event.exchange_order_id,
+                exec_id: order_event.exec_id,
+                side: order_event.side,
+                price: order_event.last_fill_px,
+                qty: order_event.last_fill_qty,
+                recv_ts_ns: order_event.recv_ts_ns,
+            }));
+        }
+        Ok(events)
+    }
+
     pub fn manager(&self) -> &OrderManager {
         &self.manager
     }
@@ -424,6 +463,12 @@ impl OrderThreadEngine {
         self.products
             .iter()
             .find(|spec| spec.symbol_id == symbol_id)
+    }
+
+    fn product_by_coinbase_symbol(&self, symbol: &str) -> Option<&ProductSpec> {
+        self.products
+            .iter()
+            .find(|spec| spec.coinbase_product == symbol)
     }
 
     fn take_seq_num(&mut self) -> u64 {
@@ -443,4 +488,11 @@ fn format_scaled(value: i64, scale: i64) -> String {
     let int = abs / scale;
     let frac = abs % scale;
     format!("{sign}{int}.{frac:0decimals$}")
+}
+
+fn fix_symbol<'a>(parser: &FixParser, frame: &'a FixFrame<'a>) -> Option<&'a str> {
+    parser
+        .fields(frame)
+        .find(|field| field.tag == 55)
+        .and_then(|field| std::str::from_utf8(field.value).ok())
 }

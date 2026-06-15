@@ -12,10 +12,12 @@ use time::{OffsetDateTime, format_description::FormatItem, macros::format_descri
 
 use crate::account::parse_rest_accounts_snapshot;
 use crate::config::{AppConfig, ProductConfig};
+use crate::event::ExchangeEvent;
 use crate::fix::coinbase::auth::{CoinbaseAuth, CoinbaseCredentials};
 use crate::fix::coinbase::market_data::parse_market_data;
 use crate::fix::{FixEncoder, FixParser, MsgType};
 use crate::market::{L1Book, L1Update, MarketEvent};
+use crate::order::{OrderManager, OrderThreadEngine};
 use crate::types::ProductSpec;
 
 const FIX_TIMESTAMP_FORMAT: &[FormatItem<'_>] =
@@ -26,6 +28,7 @@ pub struct RuntimeOptions {
     pub config_path: String,
     pub dry_run: bool,
     pub market_data: bool,
+    pub order_entry: bool,
     pub account: bool,
     pub once: bool,
 }
@@ -36,6 +39,7 @@ impl Default for RuntimeOptions {
             config_path: "config/sandbox.toml.example".to_string(),
             dry_run: false,
             market_data: true,
+            order_entry: false,
             account: false,
             once: false,
         }
@@ -61,12 +65,21 @@ impl RuntimeOptions {
                 "--once" => opts.once = true,
                 "--no-market-data" => opts.market_data = false,
                 "--no-account" => opts.account = false,
+                "--no-order-entry" => opts.order_entry = false,
+                "--with-order-entry" => opts.order_entry = true,
                 "--market-data-only" => {
                     opts.market_data = true;
+                    opts.order_entry = false;
+                    opts.account = false;
+                }
+                "--order-only" | "--order-entry-only" => {
+                    opts.market_data = false;
+                    opts.order_entry = true;
                     opts.account = false;
                 }
                 "--account-only" => {
                     opts.market_data = false;
+                    opts.order_entry = false;
                     opts.account = true;
                 }
                 "--with-account" => opts.account = true,
@@ -198,11 +211,16 @@ pub fn run(opts: RuntimeOptions) -> Result<(), RuntimeError> {
         run_fix_market_data(&config, &credentials, opts.once, shutdown)?;
     }
 
+    if opts.order_entry {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        run_fix_order_entry(&config, &credentials, opts.once, shutdown)?;
+    }
+
     Ok(())
 }
 
 fn usage() -> String {
-    "Usage: cb-hft [--config PATH] [--dry-run] [--once] [--market-data-only|--account-only|--with-account] [--no-market-data] [--no-account]".to_string()
+    "Usage: cb-hft [--config PATH] [--dry-run] [--once] [--market-data-only|--order-only|--account-only|--with-order-entry|--with-account] [--no-market-data] [--no-order-entry] [--no-account]".to_string()
 }
 
 fn print_startup_summary(opts: &RuntimeOptions, config: &AppConfig) {
@@ -210,8 +228,8 @@ fn print_startup_summary(opts: &RuntimeOptions, config: &AppConfig) {
     println!("[runtime] environment={}", config.coinbase.environment);
     println!("[runtime] products={}", product_ids(config).join(","));
     println!(
-        "[runtime] fix_market_data={} rest_account={} once={} dry_run={}",
-        opts.market_data, opts.account, opts.once, opts.dry_run
+        "[runtime] fix_market_data={} fix_order_entry={} rest_account={} once={} dry_run={}",
+        opts.market_data, opts.order_entry, opts.account, opts.once, opts.dry_run
     );
 }
 
@@ -259,6 +277,14 @@ fn rest_base_url(environment: &str) -> &'static str {
         "https://api.exchange.coinbase.com"
     } else {
         "https://api-public.sandbox.exchange.coinbase.com"
+    }
+}
+
+fn fix_ord_host(environment: &str) -> &'static str {
+    if environment.eq_ignore_ascii_case("prod") || environment.eq_ignore_ascii_case("production") {
+        "fix-ord.exchange.coinbase.com"
+    } else {
+        "fix-ord.sandbox.exchange.coinbase.com"
     }
 }
 
@@ -397,6 +423,106 @@ fn run_fix_market_data(
     Ok(())
 }
 
+fn run_fix_order_entry(
+    config: &AppConfig,
+    credentials: &CoinbaseCredentials,
+    once: bool,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), RuntimeError> {
+    let host = fix_ord_host(&config.coinbase.environment);
+    let addr = format!("{host}:6121");
+    println!("[order.fix] connecting tcp+ssl://{addr}");
+
+    let tcp = TcpStream::connect(&addr)?;
+    tcp.set_nodelay(true)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let connector = TlsConnector::new()?;
+    let mut stream = connector
+        .connect(host, tcp)
+        .map_err(|err| RuntimeError::Protocol(format!("tls handshake failed: {err}")))?;
+
+    let encoder = FixEncoder::new("FIXT.1.1", &credentials.api_key, "CBSE");
+    let parser = FixParser::default();
+    let mut sender_seq = 1u64;
+    let manager = OrderManager::default();
+    let products: Vec<_> = config.products.iter().map(|product| product.spec).collect();
+    let mut order_engine = OrderThreadEngine::new(encoder.clone(), manager, products);
+
+    let logon_time = fix_sending_time()?;
+    let logon = encoder.encode_coinbase_logon(sender_seq, &logon_time, 10, credentials, true)?;
+    sender_seq += 1;
+    stream.write_all(&logon)?;
+    stream.flush()?;
+    println!("[order.fix] sent Logon 35=A MsgSeqNum=1 TargetCompID=CBSE CancelOnDisconnect=Y");
+
+    let mut read_buf = [0u8; 8192];
+    let mut pending = Vec::<u8>::with_capacity(64 * 1024);
+    let mut printed = 0usize;
+
+    while !shutdown.load(Ordering::SeqCst) {
+        let n = stream.read(&mut read_buf)?;
+        if n == 0 {
+            return Err(RuntimeError::Protocol(
+                "FIX order-entry connection closed".to_string(),
+            ));
+        }
+        pending.extend_from_slice(&read_buf[..n]);
+
+        loop {
+            let Some((frame, consumed)) = parser.next_frame(&pending)? else {
+                break;
+            };
+
+            match frame.msg_type {
+                MsgType::Logon => {
+                    println!("[order.fix] received Logon 35=A; order entry session ready");
+                    if once {
+                        shutdown.store(true, Ordering::SeqCst);
+                    }
+                }
+                MsgType::TestRequest => {
+                    let heartbeat = encoder.encode_heartbeat(
+                        sender_seq,
+                        &fix_sending_time()?,
+                        test_req_id(&parser, &frame),
+                    );
+                    sender_seq += 1;
+                    stream.write_all(&heartbeat)?;
+                    stream.flush()?;
+                }
+                MsgType::Heartbeat => {}
+                MsgType::ExecutionReport => {
+                    let events = order_engine
+                        .on_execution_report(&parser, &frame, recv_ts_ns())
+                        .map_err(|err| {
+                            RuntimeError::Protocol(format!("order report parse error: {err:?}"))
+                        })?;
+                    for event in events {
+                        print_order_exchange_event(event);
+                        printed += 1;
+                    }
+                    if once && printed > 0 {
+                        shutdown.store(true, Ordering::SeqCst);
+                    }
+                }
+                MsgType::OrderCancelReject => {
+                    println!(
+                        "[order.fix] received OrderCancelReject 35=9 raw_len={}",
+                        frame.raw.len()
+                    );
+                }
+                other => {
+                    println!("[order.fix] received {other:?}");
+                }
+            }
+
+            pending.drain(..consumed);
+        }
+    }
+
+    Ok(())
+}
+
 fn test_req_id<'a>(parser: &FixParser, frame: &'a crate::fix::FixFrame<'a>) -> Option<&'a str> {
     parser
         .fields(frame)
@@ -458,6 +584,38 @@ fn print_market_event(event: MarketEvent, book: &mut L1Book) {
             trade.sequence,
             trade.recv_ts_ns
         ),
+    }
+}
+
+fn print_order_exchange_event(event: ExchangeEvent) {
+    match event {
+        ExchangeEvent::Order(order) => println!(
+            "[order.fix.event] symbol_id={} client_order_id={} exchange_order_id={} exec_id={} status={:?} filled_qty={} remaining_qty={} avg_px={} last_px={} last_qty={} seq={} recv_ts_ns={}",
+            order.symbol_id.0,
+            order.client_order_id,
+            order.exchange_order_id,
+            order.exec_id,
+            order.status,
+            order.filled_qty.0,
+            order.remaining_qty.0,
+            order.avg_fill_px.0,
+            order.last_fill_px.0,
+            order.last_fill_qty.0,
+            order.sequence,
+            order.recv_ts_ns
+        ),
+        ExchangeEvent::Fill(fill) => println!(
+            "[order.fix.fill] symbol_id={} client_order_id={} exchange_order_id={} exec_id={} side={:?} price={} qty={} recv_ts_ns={}",
+            fill.symbol_id.0,
+            fill.client_order_id,
+            fill.exchange_order_id,
+            fill.exec_id,
+            fill.side,
+            fill.price.0,
+            fill.qty.0,
+            fill.recv_ts_ns
+        ),
+        other => println!("[order.fix.event] {other:?}"),
     }
 }
 

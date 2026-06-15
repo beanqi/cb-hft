@@ -8,6 +8,8 @@ pub enum OrderEntryError {
     InvalidUnsignedInteger,
     MissingClientOrderId,
     MissingExecId,
+    MissingSymbol,
+    UnknownSymbol,
     InvalidSide,
 }
 
