@@ -43,11 +43,11 @@ impl Default for RuntimeOptions {
         Self {
             config_path: "config/sandbox.toml.example".to_string(),
             dry_run: false,
-            market_data: true,
+            market_data: false,
             order_entry: false,
             account: false,
             once: false,
-            dashboard: false,
+            dashboard: true,
         }
     }
 }
@@ -69,6 +69,10 @@ impl RuntimeOptions {
                 }
                 "--dry-run" => opts.dry_run = true,
                 "--once" => opts.once = true,
+                "--no-dashboard" => {
+                    opts.dashboard = false;
+                    opts.market_data = true;
+                }
                 "--no-market-data" => opts.market_data = false,
                 "--no-account" => opts.account = false,
                 "--no-order-entry" => opts.order_entry = false,
@@ -89,7 +93,12 @@ impl RuntimeOptions {
                     opts.account = true;
                 }
                 "--with-account" => opts.account = true,
-                "--dashboard" => opts.dashboard = true,
+                "--dashboard" => {
+                    opts.dashboard = true;
+                    opts.market_data = false;
+                    opts.order_entry = false;
+                    opts.account = false;
+                }
                 "--help" | "-h" => return Err(RuntimeError::Usage(usage())),
                 other => {
                     return Err(RuntimeError::Usage(format!(
@@ -437,7 +446,7 @@ pub fn run(opts: RuntimeOptions) -> Result<(), RuntimeError> {
 }
 
 fn usage() -> String {
-    "Usage: cb-hft [--config PATH] [--dashboard] [--dry-run] [--once] [--market-data-only|--order-only|--account-only|--with-order-entry|--with-account] [--no-market-data] [--no-order-entry] [--no-account]".to_string()
+    "Usage: cb-hft [--config PATH] [--dashboard|--no-dashboard] [--dry-run] [--once] [--market-data-only|--order-only|--account-only|--with-order-entry|--with-account] [--no-market-data] [--no-order-entry] [--no-account]".to_string()
 }
 
 fn print_startup_summary(opts: &RuntimeOptions, config: &AppConfig) {

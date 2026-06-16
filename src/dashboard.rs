@@ -157,6 +157,7 @@ fn start_runtime(
     let child = Command::new(exe)
         .arg("--config")
         .arg(config_path)
+        .arg("--no-dashboard")
         .arg("--with-order-entry")
         .env("CB_HFT_FEED_FILE", &feed_file)
         .stdout(Stdio::inherit())
