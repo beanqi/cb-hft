@@ -407,7 +407,17 @@ pub fn run(opts: RuntimeOptions) -> Result<(), RuntimeError> {
         return Ok(());
     }
 
-    let credentials = credentials_from_env(&config)?;
+    let credentials = match credentials_from_env(&config) {
+        Ok(credentials) => credentials,
+        Err(RuntimeError::MissingCredentials(names)) => {
+            println!(
+                "[runtime] credentials not configured ({}); runtime is idle. Configure API keys in dashboard or config file, then start again to open FIX connections.",
+                names.join(",")
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
 
     if opts.account {
         print_accounts_snapshot(&config, &credentials)?;

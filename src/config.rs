@@ -212,6 +212,24 @@ impl AppConfig {
             products,
         })
     }
+
+    pub fn missing_credential_names(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        if std::env::var(&self.coinbase.api_key_env).is_err() && self.coinbase.api_key.is_none() {
+            missing.push(self.coinbase.api_key_env.clone());
+        }
+        if std::env::var(&self.coinbase.api_secret_env).is_err()
+            && self.coinbase.api_secret.is_none()
+        {
+            missing.push(self.coinbase.api_secret_env.clone());
+        }
+        if std::env::var(&self.coinbase.passphrase_env).is_err()
+            && self.coinbase.passphrase.is_none()
+        {
+            missing.push(self.coinbase.passphrase_env.clone());
+        }
+        missing
+    }
 }
 
 pub fn persist_dashboard_update(
